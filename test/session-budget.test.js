@@ -9,21 +9,19 @@ import SessionBudget from "../.opencode/session-budget.js"
 import { createBudgetState, normalizeOptions, runBudgetCommand } from "../.opencode/session-budget-core.js"
 
 test("normalizes budget options", () => {
-  assert.deepEqual(normalizeOptions({ defaultLimitUsd: "$0.25", includeChildSessions: false, commandName: "cost" }, {}), {
+  assert.deepEqual(normalizeOptions({ defaultLimitUsd: "$0.25", commandName: "cost" }, {}), {
     commandName: "cost",
     defaultLimitUsd: 0.25,
-    includeChildSessions: false,
   })
 
   assert.deepEqual(normalizeOptions({}, { OPENCODE_SESSION_BUDGET_USD: "0.5" }), {
     commandName: "budget",
     defaultLimitUsd: 0.5,
-    includeChildSessions: true,
   })
 })
 
 test("locks a session when assistant message costs reach the limit", () => {
-  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+  const state = createBudgetState({ defaultLimitUsd: 0.05 })
 
   state.upsertSession({ id: "session-1" })
   state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 })
@@ -42,7 +40,7 @@ test("locks a session when assistant message costs reach the limit", () => {
 })
 
 test("ignores non-finite live costs", () => {
-  const state = createBudgetState({ defaultLimitUsd: 0.01, includeChildSessions: true })
+  const state = createBudgetState({ defaultLimitUsd: 0.01 })
 
   state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: Number.NaN })
   state.recordStepFinish({ type: "step-finish", sessionID: "session-1", messageID: "message-2", id: "step-1", cost: Infinity })
@@ -51,8 +49,8 @@ test("ignores non-finite live costs", () => {
   assert.equal(state.status("session-1").locked, false)
 })
 
-test("includes child sessions in parent budget by default", () => {
-  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+test("includes subagent sessions in the parent session budget", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.05 })
 
   state.upsertSession({ id: "parent" })
   state.upsertSession({ id: "child", parentID: "parent" })
@@ -62,18 +60,31 @@ test("includes child sessions in parent budget by default", () => {
   const result = state.status("child")
   assert.equal(result.locked, true)
   assert.equal(result.budgetID, "parent")
+  assert.equal(result.spentUsd, 0.05)
   assert.deepEqual(new Set(result.sessionIDs), new Set(["parent", "child"]))
 })
 
+test("budget status uses the parent session total for subagents", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.10 })
+
+  state.upsertSession({ id: "parent" })
+  state.upsertSession({ id: "child", parentID: "parent" })
+  state.recordAssistantMessage({ role: "assistant", sessionID: "parent", id: "message-1", cost: 0.02 })
+  state.recordAssistantMessage({ role: "assistant", sessionID: "child", id: "message-2", cost: 0.03 })
+
+  assert.match(runBudgetCommand(state, "parent", "status").message, /Spent \$0\.0500/)
+  assert.match(runBudgetCommand(state, "child", "status").message, /Spent \$0\.0500/)
+})
+
 test("does not resurrect deleted parent sessions from persisted state", () => {
-  const state = createBudgetState({ includeChildSessions: true })
+  const state = createBudgetState({})
 
   state.upsertSession({ id: "parent" })
   state.upsertSession({ id: "child", parentID: "parent" })
   state.removeSession("parent")
   runBudgetCommand(state, "child", "0.05")
 
-  const restored = createBudgetState({ includeChildSessions: true }, state.snapshot())
+  const restored = createBudgetState({}, state.snapshot())
   const status = restored.status("child")
 
   assert.equal(status.budgetID, "child")
@@ -82,7 +93,7 @@ test("does not resurrect deleted parent sessions from persisted state", () => {
 })
 
 test("ignores stale parent links to deleted sessions", () => {
-  const state = createBudgetState({ includeChildSessions: true })
+  const state = createBudgetState({})
 
   state.upsertSession({ id: "parent" })
   state.upsertSession({ id: "child", parentID: "parent" })
@@ -104,7 +115,7 @@ test("ignores stale parent links to deleted sessions", () => {
 test("ignores malformed persisted state entries", () => {
   let warnings = 0
   const state = createBudgetState(
-    { includeChildSessions: true },
+    {},
     {
       version: 1,
       sessions: [
@@ -127,10 +138,10 @@ test("ignores malformed persisted state entries", () => {
   assert.equal(warnings, 1)
 })
 
-test("breaks cyclic restored parent links", () => {
+test("handles cyclic restored parent links", () => {
   let warnings = 0
   const state = createBudgetState(
-    { includeChildSessions: true },
+    {},
     {
       version: 1,
       sessions: [
@@ -145,11 +156,11 @@ test("breaks cyclic restored parent links", () => {
 
   assert.equal(state.status("a").budgetID, "a")
   assert.equal(state.status("b").budgetID, "b")
-  assert.equal(warnings, 1)
+  assert.equal(warnings, 0)
 })
 
 test("uses the larger of assistant message cost and summed step costs", () => {
-  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+  const state = createBudgetState({ defaultLimitUsd: 0.05 })
 
   state.upsertSession({ id: "session-1" })
   state.recordStepFinish({ type: "step-finish", sessionID: "session-1", messageID: "message-1", id: "step-1", cost: 0.02 })
@@ -161,7 +172,7 @@ test("uses the larger of assistant message cost and summed step costs", () => {
 })
 
 test("sets and clears a per-session budget through the budget command", () => {
-  const state = createBudgetState({ includeChildSessions: true })
+  const state = createBudgetState({})
 
   state.upsertSession({ id: "session-1" })
   assert.match(runBudgetCommand(state, "session-1", "").message, /No budget set/)
@@ -183,7 +194,7 @@ test("sets and clears a per-session budget through the budget command", () => {
 })
 
 test("/budget off disables the env default for that session", () => {
-  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+  const state = createBudgetState({ defaultLimitUsd: 0.05 })
 
   state.upsertSession({ id: "session-1" })
   assert.equal(state.status("session-1").limitUsd, 0.05)
@@ -204,11 +215,13 @@ test("plugin injects /budget and blocks work after session budget is reached", a
   const aborted = []
   const logs = []
   const toasts = []
+  const notices = []
   const plugin = await SessionBudget(
     {
       client: {
         session: {
           abort: async ({ path }) => aborted.push(path.id),
+          promptAsync: async ({ path, body }) => notices.push({ sessionID: path.id, text: body.parts[0].text, noReply: body.noReply }),
         },
         app: {
           log: async ({ body }) => logs.push(body),
@@ -245,6 +258,18 @@ test("plugin injects /budget and blocks work after session budget is reached", a
   assert.deepEqual(aborted, ["session-1"])
   assert.equal(logs.length, 2)
   assert.equal(toasts.length, 2)
+  assert.deepEqual(notices, [
+    {
+      sessionID: "session-1",
+      text: "Budget limit reached for this session ($0.0200 / $0.0100). Opencode work has been stopped. Raise the budget with /budget 0.03, or run /budget off to continue without a budget.",
+      noReply: true,
+    },
+  ])
+
+  await plugin["chat.message"](
+    { sessionID: "session-1" },
+    { parts: [{ type: "text", metadata: { service: "session-budget" } }] },
+  )
 
   await assert.rejects(
     () => plugin["tool.execute.before"]({ tool: "bash", sessionID: "session-1", callID: "call-1" }, { args: {} }),
@@ -544,6 +569,88 @@ test("concurrent plugin instances preserve child parent links", async (t) => {
   await assert.rejects(
     () => restored["command.execute.before"]({ command: "budget", sessionID: "child", arguments: "status" }, { parts: [] }),
     /Budget is \$0\.0500.*Spent \$0\.0400/,
+  )
+})
+
+test("deleted parent budgets are not resurrected by persistence merge", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const file = path.join(worktree, statePath)
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const plugin = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "parent" } } } })
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "child", parentID: "parent" } } } })
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "parent", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "child", id: "message-1", cost: 0.03 } },
+    },
+  })
+  await waitFor(async () => (await snapshotSession(file, "child"))?.parentID === "parent")
+
+  await plugin.event({ event: { type: "session.deleted", properties: { info: { id: "parent" } } } })
+
+  await waitFor(async () => {
+    const snapshot = JSON.parse(await fs.readFile(file, "utf8"))
+    return (
+      snapshot.deletedSessions.includes("parent") &&
+      !snapshot.sessions.some((item) => item.id === "parent") &&
+      !snapshot.budgets.some(([id]) => id === "parent")
+    )
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "child", arguments: "status" }, { parts: [] }),
+    /No budget set.*Spent \$0\.0300/,
+  )
+})
+
+test("cleared parent links survive persistence merge", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const file = path.join(worktree, statePath)
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const plugin = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "parent" } } } })
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "child", parentID: "parent" } } } })
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "parent", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "child", id: "message-1", cost: 0.03 } },
+    },
+  })
+  await waitFor(async () => (await snapshotSession(file, "child"))?.parentID === "parent")
+
+  await plugin.event({ event: { type: "session.updated", properties: { info: { id: "child" } } } })
+
+  await waitFor(async () => {
+    const session = await snapshotSession(file, "child")
+    return session && !("parentID" in session)
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "child", arguments: "status" }, { parts: [] }),
+    /No budget set.*Spent \$0\.0300/,
   )
 })
 

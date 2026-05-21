@@ -18,10 +18,6 @@ export function normalizeOptions(options = {}, env = globalThis.process?.env ?? 
       rawDefaultLimit === undefined || rawDefaultLimit === null || rawDefaultLimit === ""
         ? undefined
         : parseMoney(rawDefaultLimit, "defaultLimitUsd"),
-    includeChildSessions: parseBoolean(
-      firstDefined(options.includeChildSessions, env.OPENCODE_SESSION_BUDGET_INCLUDE_CHILDREN),
-      true,
-    ),
   }
 }
 
@@ -30,6 +26,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   const budgets = new Map()
   const budgetVersions = new Map()
   const changedBudgets = new Set()
+  const changedParents = new Set()
   let budgetVersionSequence = 0
   const lockedBudgets = new Set()
   const deletedSessions = new Set()
@@ -39,7 +36,6 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       sessions.set(sessionID, {
         id: sessionID,
         parentID: undefined,
-        children: new Set(),
         messages: new Map(),
       })
     }
@@ -63,39 +59,27 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     const existed = sessions.has(info.id)
     const session = getSession(info.id)
     deletedSessions.delete(info.id)
-    const previousParentID = session.parentID
-    if (session.parentID && sessions.has(session.parentID)) {
-      sessions.get(session.parentID).children.delete(info.id)
-    }
-
-    const parentID = info.parentID && !deletedSessions.has(info.parentID) ? info.parentID : undefined
+    const parentID = info.parentID && info.parentID !== info.id && !deletedSessions.has(info.parentID) ? info.parentID : undefined
+    const changed = !existed || session.parentID !== parentID
     session.parentID = parentID
-
-    if (parentID) {
-      getSession(parentID).children.add(info.id)
-    }
-
-    return !existed || previousParentID !== parentID
+    if (changed && (existed || parentID)) changedParents.add(info.id)
+    return changed
   }
 
   function removeSession(sessionID) {
-    const session = sessions.get(sessionID)
-    if (!session) return false
-
-    if (session.parentID && sessions.has(session.parentID)) {
-      sessions.get(session.parentID).children.delete(sessionID)
-    }
-
-    for (const childID of session.children) {
-      const child = sessions.get(childID)
-      if (child) child.parentID = undefined
-    }
+    if (!sessions.has(sessionID)) return false
 
     sessions.delete(sessionID)
     budgets.delete(sessionID)
     budgetVersions.delete(sessionID)
     lockedBudgets.delete(sessionID)
     deletedSessions.add(sessionID)
+    for (const session of sessions.values()) {
+      if (session.parentID === sessionID) {
+        session.parentID = undefined
+        changedParents.add(session.id)
+      }
+    }
     return true
   }
 
@@ -118,19 +102,17 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   }
 
   function rootOf(sessionID) {
-    let current = getSession(sessionID)
+    const start = getSession(sessionID)
+    let current = start
     const seen = new Set()
 
-    while (current.parentID && sessions.has(current.parentID) && !seen.has(current.id)) {
+    while (current.parentID && sessions.has(current.parentID)) {
+      if (seen.has(current.id)) return start.id
       seen.add(current.id)
       current = sessions.get(current.parentID)
     }
 
     return current.id
-  }
-
-  function budgetIDFor(sessionID) {
-    return settings.includeChildSessions ? rootOf(sessionID) : sessionID
   }
 
   function limitForBudget(budgetID) {
@@ -151,8 +133,6 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   }
 
   function budgetSessionIDs(budgetID) {
-    if (!settings.includeChildSessions) return [budgetID]
-
     const ids = []
     for (const sessionID of sessions.keys()) {
       if (rootOf(sessionID) === budgetID) ids.push(sessionID)
@@ -178,7 +158,6 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     }
 
     const snapshotSessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : []
-    const restoredSessionIDs = new Set()
     let invalid = false
     if (!Array.isArray(snapshot.sessions) || !Array.isArray(snapshot.budgets) || !Array.isArray(snapshot.lockedBudgets)) invalid = true
 
@@ -188,8 +167,8 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
         continue
       }
       const session = getSession(item.id)
-      restoredSessionIDs.add(item.id)
-      if (item.parentID !== undefined && typeof item.parentID !== "string") invalid = true
+      if (item.parentID !== undefined && item.parentID !== null && typeof item.parentID !== "string") invalid = true
+      session.parentID = item.parentID && item.parentID !== item.id ? item.parentID : undefined
 
       for (const messageInfo of Array.isArray(item.messages) ? item.messages : []) {
         if (!messageInfo?.id || typeof messageInfo.id !== "string") {
@@ -247,48 +226,24 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       else invalid = true
     }
 
-    for (const session of sessions.values()) {
-      const item = snapshotSessions.find((candidate) => candidate?.id === session.id)
-      const parentID = item?.parentID
-      if (parentID && (!restoredSessionIDs.has(parentID) || parentID === session.id)) invalid = true
-      session.parentID = parentID && restoredSessionIDs.has(parentID) && parentID !== session.id ? parentID : undefined
-      session.children.clear()
-    }
-
-    const cyclicSessionIDs = []
-    for (const session of sessions.values()) {
-      if (hasParentCycle(session.id)) cyclicSessionIDs.push(session.id)
-    }
-
-    for (const sessionID of cyclicSessionIDs) {
-      sessions.get(sessionID).parentID = undefined
-      invalid = true
+    for (const sessionID of deletedSessions) {
+      sessions.delete(sessionID)
+      budgets.delete(sessionID)
+      budgetVersions.delete(sessionID)
+      lockedBudgets.delete(sessionID)
     }
 
     for (const session of sessions.values()) {
-      if (session.parentID) sessions.get(session.parentID).children.add(session.id)
+      if (session.parentID && (!sessions.has(session.parentID) || session.parentID === session.id)) session.parentID = undefined
     }
 
     if (invalid) onRestoreWarning()
   }
 
-  function hasParentCycle(sessionID) {
-    const seen = new Set()
-    let current = sessions.get(sessionID)
-
-    while (current?.parentID) {
-      if (seen.has(current.id)) return true
-      seen.add(current.id)
-      current = sessions.get(current.parentID)
-    }
-
-    return false
-  }
-
   restore(snapshot)
 
   function status(sessionID) {
-    const budgetID = budgetIDFor(sessionID)
+    const budgetID = rootOf(sessionID)
     const spentUsd = spentForBudget(budgetID)
     const limitUsd = limitForBudget(budgetID)
     const wasLocked = lockedBudgets.has(budgetID)
@@ -314,14 +269,14 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     recordAssistantMessage,
     recordStepFinish,
     setBudget(sessionID, limitUsd) {
-      const budgetID = budgetIDFor(sessionID)
+      const budgetID = rootOf(sessionID)
       budgets.set(budgetID, limitUsd)
       budgetVersions.set(budgetID, nextBudgetVersion(++budgetVersionSequence))
       changedBudgets.add(budgetID)
       return status(sessionID)
     },
     clearBudget(sessionID) {
-      const budgetID = budgetIDFor(sessionID)
+      const budgetID = rootOf(sessionID)
       budgets.set(budgetID, null)
       budgetVersions.set(budgetID, nextBudgetVersion(++budgetVersionSequence))
       changedBudgets.add(budgetID)
@@ -334,7 +289,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
         version: STATE_VERSION,
         sessions: [...sessions.values()].map((session) => ({
           id: session.id,
-          parentID: session.parentID,
+          parentID: session.parentID ?? null,
           messages: [...session.messages.entries()].map(([id, message]) => ({
             id,
             messageCost: message.messageCost,
@@ -344,12 +299,16 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
         budgets: [...budgets.entries()],
         budgetVersions: [...budgetVersions.entries()],
         changedBudgets: [...changedBudgets],
+        changedParents: [...changedParents],
         lockedBudgets: [...lockedBudgets],
         deletedSessions: [...deletedSessions],
       }
     },
     markBudgetChangesSaved(budgetIDs = []) {
       for (const budgetID of budgetIDs) changedBudgets.delete(budgetID)
+    },
+    markParentChangesSaved(sessionIDs = []) {
+      for (const sessionID of sessionIDs) changedParents.delete(sessionID)
     },
     isLocked(sessionID) {
       return status(sessionID).locked
@@ -403,12 +362,14 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
   function saveSoon() {
     const snapshot = state.snapshot()
     state.markBudgetChangesSaved(snapshot.changedBudgets)
+    state.markParentChangesSaved(snapshot.changedParents)
     void persistence.save(snapshot)
   }
 
   async function saveNow() {
     const snapshot = state.snapshot()
     state.markBudgetChangesSaved(snapshot.changedBudgets)
+    state.markParentChangesSaved(snapshot.changedParents)
     await persistence.save(snapshot, true)
   }
 
@@ -435,6 +396,7 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
     const message = blockedMessage(result)
     await log(client, "warn", message)
     await toast(client, message, "error")
+    await printSessionNotice(client, result.budgetID, budgetStopMessage(result), warnOnce)
   }
 
   return {
@@ -473,7 +435,8 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
         if (changed) saveSoon()
       }
     },
-    "chat.message": async (input) => {
+    "chat.message": async (input, output) => {
+      if (isBudgetNotice(output?.parts)) return
       await assertOpen(input.sessionID)
     },
     "chat.params": async (input) => {
@@ -513,6 +476,14 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
 
 export function blockedMessage(result) {
   return `Budget limit reached for this session (${formatUsd(result.spentUsd)} / ${formatUsd(result.limitUsd)}). Opencode work has been stopped.`
+}
+
+function budgetStopMessage(result) {
+  return `${blockedMessage(result)} Raise the budget with /budget ${formatUsdForCommand(nextBudget(result.spentUsd))}, or run /budget off to continue without a budget.`
+}
+
+function isBudgetNotice(parts) {
+  return Array.isArray(parts) && parts.some((part) => part?.type === "text" && part.metadata?.service === SERVICE)
 }
 
 function firstDefined(...values) {
@@ -555,6 +526,30 @@ function spentMessage(status) {
 function formatUsd(value) {
   if (value === undefined) return "unconfigured"
   return `$${value.toFixed(value >= 1 ? 2 : 4)}`
+}
+
+function formatUsdForCommand(value) {
+  return value.toFixed(2)
+}
+
+function nextBudget(spentUsd) {
+  return Math.ceil((spentUsd + 0.01) * 100) / 100
+}
+
+async function printSessionNotice(client, sessionID, message, warnOnce = async () => {}) {
+  if (!client.session?.promptAsync) return
+
+  try {
+    await client.session.promptAsync({
+      path: { id: sessionID },
+      body: {
+        noReply: true,
+        parts: [{ type: "text", text: message, synthetic: true, metadata: { service: SERVICE } }],
+      },
+    })
+  } catch (error) {
+    await warnOnce(`notice:${sessionID}`, `Failed to print over-budget session notice for ${sessionID}: ${errorMessage(error)}`)
+  }
 }
 
 async function abortSession(client, sessionID, warnOnce = async () => {}) {
@@ -691,17 +686,18 @@ function mergeSnapshots(current, next) {
 
   const deleted = new Set([...(arrayOfStrings(current.deletedSessions) ?? []), ...(arrayOfStrings(next.deletedSessions) ?? [])])
   const changedBudgets = new Set(arrayOfStrings(next.changedBudgets) ?? [])
+  const changedParents = new Set(arrayOfStrings(next.changedParents) ?? [])
   const sessions = new Map()
   const budgets = new Map()
   const budgetVersions = new Map()
   const lockedBudgets = new Set()
 
   for (const item of Array.isArray(current.sessions) ? current.sessions : []) {
-    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted))
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted, changedParents))
   }
 
   for (const item of Array.isArray(next.sessions) ? next.sessions : []) {
-    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted))
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted, changedParents))
   }
 
   for (const entry of Array.isArray(current.budgets) ? current.budgets : []) {
@@ -730,6 +726,7 @@ function mergeSnapshots(current, next) {
     budgets: [...budgets.entries()],
     budgetVersions: [...budgetVersions.entries()],
     changedBudgets: [],
+    changedParents: [],
     lockedBudgets: [...lockedBudgets],
     deletedSessions: [...deleted],
   }
@@ -762,8 +759,11 @@ function budgetVersionFor(snapshot, budgetID) {
   return legacyBudgetVersion()
 }
 
-function mergeSessionSnapshot(current, next, deleted) {
-  if (!current) return next
+function mergeSessionSnapshot(current, next, deleted, changedParents) {
+  if (!current) {
+    const parentID = next.parentID && !deleted.has(next.parentID) ? next.parentID : undefined
+    return { ...next, parentID }
+  }
 
   const messages = new Map()
   for (const item of Array.isArray(current.messages) ? current.messages : []) {
@@ -773,7 +773,7 @@ function mergeSessionSnapshot(current, next, deleted) {
     if (item?.id && typeof item.id === "string") messages.set(item.id, mergeMessageSnapshot(messages.get(item.id), item))
   }
 
-  let parentID = next.parentID !== undefined ? next.parentID : current.parentID
+  let parentID = changedParents.has(next.id) ? (next.parentID ?? undefined) : current.parentID
   if (parentID && deleted.has(parentID)) parentID = undefined
 
   return {

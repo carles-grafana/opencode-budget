@@ -104,17 +104,12 @@ When the budget is reached, the plugin:
 - Aborts the session and its child sessions by default.
 - Blocks future model calls, tool executions, slash commands, and compaction auto-continue for the locked session.
 - Denies pending permission prompts for the locked session.
+- Prints a no-reply message in the session explaining that the budget was reached and how to continue.
 - Shows a TUI toast and writes an Opencode app log entry when available.
 
 `/budget` is intercepted before the command prompt reaches the model, so setting or checking a budget should not spend tokens. Opencode does not currently expose a clean "handled command" return from plugins, so the plugin throws after handling `/budget` to stop the normal command path.
 
-`includeChildSessions` defaults to `true`, so subagent work counts against the parent session budget. Set it to `false` in plugin options if every session should have its own independent limit:
-
-```json
-{
-  "plugin": [["github:carles-grafana/opencode-session-budget", { "includeChildSessions": false }]]
-}
-```
+Budgets are scoped to the current Opencode session. Subagent child sessions count against their parent session budget; unrelated sessions keep separate budgets and spend.
 
 You can also set a default per-session budget for new sessions with:
 
