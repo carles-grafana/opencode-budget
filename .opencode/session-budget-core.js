@@ -29,6 +29,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   const sessions = new Map()
   const budgets = new Map()
   const lockedBudgets = new Set()
+  const deletedSessions = new Set()
 
   function getSession(sessionID) {
     if (!sessions.has(sessionID)) {
@@ -58,6 +59,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
 
     const existed = sessions.has(info.id)
     const session = getSession(info.id)
+    deletedSessions.delete(info.id)
     const previousParentID = session.parentID
     if (session.parentID && sessions.has(session.parentID)) {
       sessions.get(session.parentID).children.delete(info.id)
@@ -88,11 +90,12 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     sessions.delete(sessionID)
     budgets.delete(sessionID)
     lockedBudgets.delete(sessionID)
+    deletedSessions.add(sessionID)
     return true
   }
 
   function recordAssistantMessage(info) {
-    if (info?.role !== "assistant" || !info.sessionID || !info.id || typeof info.cost !== "number") return false
+    if (info?.role !== "assistant" || !info.sessionID || !info.id || !Number.isFinite(info.cost)) return false
     const message = getMessage(info.sessionID, info.id)
     const cost = Math.max(0, info.cost)
     if (message.messageCost === cost) return false
@@ -101,7 +104,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   }
 
   function recordStepFinish(part) {
-    if (part?.type !== "step-finish" || !part.sessionID || !part.messageID || !part.id || typeof part.cost !== "number") return false
+    if (part?.type !== "step-finish" || !part.sessionID || !part.messageID || !part.id || !Number.isFinite(part.cost)) return false
     const message = getMessage(part.sessionID, part.messageID)
     const cost = Math.max(0, part.cost)
     if (message.stepCosts.get(part.id) === cost) return false
@@ -162,10 +165,17 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
   }
 
   function restore(snapshot) {
-    if (!snapshot || snapshot.version !== STATE_VERSION) return
+    if (!snapshot) return
+
+    if (snapshot.version !== STATE_VERSION) {
+      onRestoreWarning()
+      return
+    }
+
     const snapshotSessions = Array.isArray(snapshot.sessions) ? snapshot.sessions : []
     const restoredSessionIDs = new Set()
     let invalid = false
+    if (!Array.isArray(snapshot.sessions) || !Array.isArray(snapshot.budgets) || !Array.isArray(snapshot.lockedBudgets)) invalid = true
 
     for (const item of snapshotSessions) {
       if (!item?.id || typeof item.id !== "string") {
@@ -205,7 +215,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       }
 
       const [budgetID, limitUsd] = entry
-      if (budgetID && typeof budgetID === "string" && (Number.isFinite(limitUsd) || limitUsd === null)) budgets.set(budgetID, limitUsd)
+      if (budgetID && typeof budgetID === "string" && ((Number.isFinite(limitUsd) && limitUsd > 0) || limitUsd === null)) budgets.set(budgetID, limitUsd)
       else invalid = true
     }
 
@@ -214,11 +224,27 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       else invalid = true
     }
 
+    for (const sessionID of Array.isArray(snapshot.deletedSessions) ? snapshot.deletedSessions : []) {
+      if (sessionID && typeof sessionID === "string") deletedSessions.add(sessionID)
+      else invalid = true
+    }
+
     for (const session of sessions.values()) {
       const item = snapshotSessions.find((candidate) => candidate?.id === session.id)
-      if (item?.parentID && !restoredSessionIDs.has(item.parentID)) invalid = true
-      session.parentID = item?.parentID && restoredSessionIDs.has(item.parentID) ? item.parentID : undefined
+      const parentID = item?.parentID
+      if (parentID && (!restoredSessionIDs.has(parentID) || parentID === session.id)) invalid = true
+      session.parentID = parentID && restoredSessionIDs.has(parentID) && parentID !== session.id ? parentID : undefined
       session.children.clear()
+    }
+
+    const cyclicSessionIDs = []
+    for (const session of sessions.values()) {
+      if (hasParentCycle(session.id)) cyclicSessionIDs.push(session.id)
+    }
+
+    for (const sessionID of cyclicSessionIDs) {
+      sessions.get(sessionID).parentID = undefined
+      invalid = true
     }
 
     for (const session of sessions.values()) {
@@ -226,6 +252,19 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     }
 
     if (invalid) onRestoreWarning()
+  }
+
+  function hasParentCycle(sessionID) {
+    const seen = new Set()
+    let current = sessions.get(sessionID)
+
+    while (current?.parentID) {
+      if (seen.has(current.id)) return true
+      seen.add(current.id)
+      current = sessions.get(current.parentID)
+    }
+
+    return false
   }
 
   restore(snapshot)
@@ -282,6 +321,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
         })),
         budgets: [...budgets.entries()],
         lockedBudgets: [...lockedBudgets],
+        deletedSessions: [...deletedSessions],
       }
     },
     isLocked(sessionID) {
@@ -333,8 +373,12 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
   const notifiedBudgets = new Map()
   const abortedSessions = new Map()
 
-  async function save() {
-    await persistence.save(state.snapshot())
+  function saveSoon() {
+    void persistence.save(state.snapshot())
+  }
+
+  async function saveNow() {
+    await persistence.save(state.snapshot(), true)
   }
 
   async function enforce(sessionID) {
@@ -374,12 +418,12 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
       if (event.type === "session.created" || event.type === "session.updated") {
         const changed = state.upsertSession(event.properties.info)
         await enforce(event.properties.info.id)
-        if (changed) await save()
+        if (changed) saveSoon()
         return
       }
 
       if (event.type === "session.deleted") {
-        if (state.removeSession(event.properties.info.id)) await save()
+        if (state.removeSession(event.properties.info.id)) saveSoon()
         return
       }
 
@@ -387,7 +431,7 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
         const info = event.properties.info
         const changed = state.recordAssistantMessage(info)
         if (info?.sessionID) await enforce(info.sessionID)
-        if (changed) await save()
+        if (changed) saveSoon()
         return
       }
 
@@ -395,7 +439,7 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
         const part = event.properties.part
         const changed = state.recordStepFinish(part)
         if (part?.sessionID) await enforce(part.sessionID)
-        if (changed) await save()
+        if (changed) saveSoon()
       }
     },
     "chat.message": async (input) => {
@@ -408,7 +452,7 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
       if (input.command === settings.commandName) {
         const shouldSave = !/^\s*(status)?\s*$/i.test(input.arguments ?? "")
         const result = runBudgetCommand(state, input.sessionID, input.arguments)
-        if (shouldSave) await save()
+        if (shouldSave) await saveNow()
         notifiedBudgets.delete(result.status.budgetID)
         for (const sessionID of result.status.sessionIDs) abortedSessions.delete(sessionID)
         await log(client, result.status.locked ? "warn" : "info", result.message)
@@ -526,14 +570,25 @@ function createPersistence(input = {}, options = {}, env = globalThis.process?.e
   if (!file) return { load: async () => undefined, save: async () => {} }
 
   let pending = Promise.resolve()
+  let queuedSnapshot
+  let queuedWrite
 
   async function write(snapshot) {
     try {
-      await fs.mkdir(path.dirname(file), { recursive: true })
-      const random = Math.random().toString(36).slice(2)
-      const temp = `${file}.${globalThis.process?.pid ?? "tmp"}.${Date.now()}.${random}.tmp`
-      await fs.writeFile(temp, `${JSON.stringify(snapshot)}\n`)
-      await fs.rename(temp, file)
+      await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+      await withStateLock(file, warnOnce, async () => {
+        const current = await readSnapshotFile(file, warnOnce)
+        const merged = mergeSnapshots(current, snapshot)
+        const random = Math.random().toString(36).slice(2)
+        const temp = `${file}.${globalThis.process?.pid ?? "tmp"}.${Date.now()}.${random}.tmp`
+        try {
+          await fs.writeFile(temp, `${JSON.stringify(merged)}\n`, { mode: 0o600 })
+          await fs.rename(temp, file)
+        } catch (error) {
+          await fs.rm(temp, { force: true }).catch(() => {})
+          await warnOnce(`state:save:${file}`, `Failed to persist session budget state to ${file}: ${errorMessage(error)}`)
+        }
+      })
     } catch (error) {
       await warnOnce(`state:save:${file}`, `Failed to persist session budget state to ${file}: ${errorMessage(error)}`)
     }
@@ -541,20 +596,108 @@ function createPersistence(input = {}, options = {}, env = globalThis.process?.e
 
   return {
     async load() {
-      try {
-        return JSON.parse(await fs.readFile(file, "utf8"))
-      } catch (error) {
-        if (error?.code !== "ENOENT") {
-          await warnOnce(`state:load:${file}`, `Failed to load session budget state from ${file}: ${errorMessage(error)}`)
-        }
-        return undefined
-      }
+      return readSnapshotFile(file, warnOnce)
     },
-    save(snapshot) {
-      pending = pending.then(() => write(snapshot), () => write(snapshot))
-      return pending
+    save(snapshot, wait = false) {
+      queuedSnapshot = snapshot
+      if (!queuedWrite) {
+        queuedWrite = Promise.resolve().then(() => {
+          const next = queuedSnapshot
+          queuedSnapshot = undefined
+          queuedWrite = undefined
+          pending = pending.then(() => write(next), () => write(next))
+          return pending
+        })
+      }
+      return wait ? queuedWrite : Promise.resolve()
     },
   }
+}
+
+async function readSnapshotFile(file, warnOnce) {
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"))
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      await warnOnce(`state:load:${file}`, `Failed to load session budget state from ${file}: ${errorMessage(error)}`)
+    }
+    return undefined
+  }
+}
+
+async function withStateLock(file, warnOnce, fn) {
+  const lock = `${file}.lock`
+  const started = Date.now()
+
+  while (true) {
+    try {
+      await fs.mkdir(lock, { mode: 0o700 })
+      break
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        await warnOnce(`state:lock:${file}`, `Failed to lock session budget state ${file}: ${errorMessage(error)}`)
+        return
+      }
+
+      if (Date.now() - started > 2000) {
+        await warnOnce(`state:lock:${file}`, `Timed out locking session budget state ${file}; skipping this save.`)
+        return
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+  }
+
+  try {
+    await fn()
+  } finally {
+    await fs.rm(lock, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+function mergeSnapshots(current, next) {
+  if (!current || current.version !== STATE_VERSION) return next
+
+  const deleted = new Set([...(arrayOfStrings(current.deletedSessions) ?? []), ...(arrayOfStrings(next.deletedSessions) ?? [])])
+  const sessions = new Map()
+  const budgets = new Map()
+  const lockedBudgets = new Set()
+
+  for (const item of Array.isArray(current.sessions) ? current.sessions : []) {
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, item)
+  }
+
+  for (const item of Array.isArray(next.sessions) ? next.sessions : []) {
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, item)
+  }
+
+  for (const entry of Array.isArray(current.budgets) ? current.budgets : []) {
+    if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && !deleted.has(entry[0])) budgets.set(entry[0], entry[1])
+  }
+
+  for (const entry of Array.isArray(next.budgets) ? next.budgets : []) {
+    if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && !deleted.has(entry[0])) budgets.set(entry[0], entry[1])
+  }
+
+  for (const budgetID of arrayOfStrings(current.lockedBudgets) ?? []) {
+    if (!deleted.has(budgetID)) lockedBudgets.add(budgetID)
+  }
+
+  for (const budgetID of arrayOfStrings(next.lockedBudgets) ?? []) {
+    if (!deleted.has(budgetID)) lockedBudgets.add(budgetID)
+  }
+
+  return {
+    version: STATE_VERSION,
+    sessions: [...sessions.values()],
+    budgets: [...budgets.entries()],
+    lockedBudgets: [...lockedBudgets],
+    deletedSessions: [...deleted],
+  }
+}
+
+function arrayOfStrings(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === "string") : undefined
 }
 
 function resolveStatePath(configured, base) {

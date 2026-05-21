@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import crypto from "node:crypto"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
@@ -38,6 +39,16 @@ test("locks a session when assistant message costs reach the limit", () => {
   const second = state.status("session-1")
   assert.equal(second.locked, true)
   assert.equal(second.justLocked, false)
+})
+
+test("ignores non-finite live costs", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.01, includeChildSessions: true })
+
+  state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: Number.NaN })
+  state.recordStepFinish({ type: "step-finish", sessionID: "session-1", messageID: "message-2", id: "step-1", cost: Infinity })
+
+  assert.equal(state.spentUsd("session-1"), 0)
+  assert.equal(state.status("session-1").locked, false)
 })
 
 test("includes child sessions in parent budget by default", () => {
@@ -83,7 +94,7 @@ test("ignores malformed persisted state entries", () => {
           messages: [{ id: "message-1", messageCost: "bad", stepCosts: [null, ["step-1", 0.01]] }],
         },
       ],
-      budgets: [null, ["session-1", 0.05], ["bad", "not-money"]],
+      budgets: [null, ["session-1", 0.05], ["bad", "not-money"], ["free", 0]],
       lockedBudgets: [null, "session-1"],
     },
     () => warnings++,
@@ -93,6 +104,27 @@ test("ignores malformed persisted state entries", () => {
   assert.equal(status.budgetID, "session-1")
   assert.equal(status.limitUsd, 0.05)
   assert.equal(status.spentUsd, 0.01)
+  assert.equal(warnings, 1)
+})
+
+test("breaks cyclic restored parent links", () => {
+  let warnings = 0
+  const state = createBudgetState(
+    { includeChildSessions: true },
+    {
+      version: 1,
+      sessions: [
+        { id: "a", parentID: "b", messages: [] },
+        { id: "b", parentID: "a", messages: [] },
+      ],
+      budgets: [],
+      lockedBudgets: [],
+    },
+    () => warnings++,
+  )
+
+  assert.equal(state.status("a").budgetID, "a")
+  assert.equal(state.status("b").budgetID, "b")
   assert.equal(warnings, 1)
 })
 
@@ -275,13 +307,129 @@ test("plugin persists budget state outside the worktree by default", async (t) =
       properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 } },
     },
   })
+  await waitFor(async () => {
+    const snapshot = JSON.parse(await fs.readFile(defaultStatePath(stateHome, worktree), "utf8"))
+    const session = snapshot.sessions.find((item) => item.id === "session-1")
+    const message = session?.messages.find((item) => item.id === "message-1")
+    return message?.messageCost === 0.02
+  })
   assert.equal(await pathExists(path.join(worktree, ".opencode", "session-budget-state.json")), false)
+  assert.equal(await pathExists(defaultStatePath(stateHome, worktree)), true)
 
   plugin = await SessionBudget({ client, worktree, directory: worktree }, {})
 
   await assert.rejects(
     () => plugin["tool.execute.before"]({ tool: "bash", sessionID: "session-1", callID: "call-1" }, { args: {} }),
     /Budget limit reached/,
+  )
+})
+
+test("default persistence separates worktrees", async (t) => {
+  const first = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-first-"))
+  const second = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-second-"))
+  const stateHome = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-state-"))
+  const previousStateHome = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = stateHome
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = previousStateHome
+    await fs.rm(first, { recursive: true, force: true })
+    await fs.rm(second, { recursive: true, force: true })
+    await fs.rm(stateHome, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const firstPlugin = await SessionBudget({ client, worktree: first, directory: first }, {})
+  const secondPlugin = await SessionBudget({ client, worktree: second, directory: second }, {})
+
+  await assert.rejects(
+    () => firstPlugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await assert.rejects(
+    () => secondPlugin["command.execute.before"]({ command: "budget", sessionID: "session-2", arguments: "0.02" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  assert.notEqual(defaultStatePath(stateHome, first), defaultStatePath(stateHome, second))
+  assert.equal(await pathExists(defaultStatePath(stateHome, first)), true)
+  assert.equal(await pathExists(defaultStatePath(stateHome, second)), true)
+})
+
+test("configured statePath persists relative to the worktree", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const plugin = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  assert.equal(await pathExists(path.join(worktree, statePath)), true)
+})
+
+test("disabled persistence does not write state", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const stateHome = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-state-"))
+  const previousStateHome = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = stateHome
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = previousStateHome
+    await fs.rm(worktree, { recursive: true, force: true })
+    await fs.rm(stateHome, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const plugin = await SessionBudget({ client, worktree, directory: worktree }, { persistState: false })
+
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  assert.equal(await pathExists(defaultStatePath(stateHome, worktree)), false)
+})
+
+test("concurrent plugin instances merge persisted state", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const stateHome = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-state-"))
+  const previousStateHome = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = stateHome
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = previousStateHome
+    await fs.rm(worktree, { recursive: true, force: true })
+    await fs.rm(stateHome, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, {})
+  const second = await SessionBudget({ client, worktree, directory: worktree }, {})
+
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await assert.rejects(
+    () => second["command.execute.before"]({ command: "budget", sessionID: "session-2", arguments: "0.02" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, {})
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.0100/,
+  )
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-2", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.0200/,
   )
 })
 
@@ -292,4 +440,20 @@ async function pathExists(file) {
   } catch {
     return false
   }
+}
+
+function defaultStatePath(stateHome, worktree) {
+  const key = crypto.createHash("sha256").update(worktree).digest("hex")
+  return path.join(stateHome, "opencode-session-budget", `${key}.json`)
+}
+
+async function waitFor(predicate) {
+  const started = Date.now()
+  while (Date.now() - started < 1000) {
+    try {
+      if (await predicate()) return
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.fail("condition was not met before timeout")
 }
