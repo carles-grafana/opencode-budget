@@ -1,5 +1,9 @@
+import fs from "node:fs/promises"
+import path from "node:path"
+
 const DEFAULT_LIMIT_ENV = "OPENCODE_SESSION_BUDGET_USD"
 const DEFAULT_COMMAND = "budget"
+const STATE_VERSION = 1
 const SERVICE = "session-budget"
 
 export function normalizeOptions(options = {}, env = globalThis.process?.env ?? {}) {
@@ -19,7 +23,7 @@ export function normalizeOptions(options = {}, env = globalThis.process?.env ?? 
   }
 }
 
-export function createBudgetState(settings) {
+export function createBudgetState(settings, snapshot) {
   const sessions = new Map()
   const budgets = new Map()
   const lockedBudgets = new Set()
@@ -137,6 +141,41 @@ export function createBudgetState(settings) {
     return total
   }
 
+  function restore(snapshot) {
+    if (!snapshot || snapshot.version !== STATE_VERSION) return
+
+    for (const item of Array.isArray(snapshot.sessions) ? snapshot.sessions : []) {
+      if (!item?.id) continue
+      const session = getSession(item.id)
+      session.parentID = item.parentID
+
+      for (const messageInfo of Array.isArray(item.messages) ? item.messages : []) {
+        if (!messageInfo?.id) continue
+        const message = getMessage(item.id, messageInfo.id)
+        if (typeof messageInfo.messageCost === "number") message.messageCost = Math.max(0, messageInfo.messageCost)
+
+        for (const [stepID, cost] of Array.isArray(messageInfo.stepCosts) ? messageInfo.stepCosts : []) {
+          if (stepID && typeof cost === "number") message.stepCosts.set(stepID, Math.max(0, cost))
+        }
+      }
+    }
+
+    for (const [budgetID, limitUsd] of Array.isArray(snapshot.budgets) ? snapshot.budgets : []) {
+      if (budgetID && (typeof limitUsd === "number" || limitUsd === null)) budgets.set(budgetID, limitUsd)
+    }
+
+    for (const budgetID of Array.isArray(snapshot.lockedBudgets) ? snapshot.lockedBudgets : []) {
+      if (budgetID) lockedBudgets.add(budgetID)
+    }
+
+    for (const session of sessions.values()) session.children.clear()
+    for (const session of sessions.values()) {
+      if (session.parentID) getSession(session.parentID).children.add(session.id)
+    }
+  }
+
+  restore(snapshot)
+
   function status(sessionID) {
     const budgetID = budgetIDFor(sessionID)
     const spentUsd = spentForBudget(budgetID)
@@ -175,6 +214,22 @@ export function createBudgetState(settings) {
       return status(sessionID)
     },
     status,
+    snapshot() {
+      return {
+        version: STATE_VERSION,
+        sessions: [...sessions.values()].map((session) => ({
+          id: session.id,
+          parentID: session.parentID,
+          messages: [...session.messages.entries()].map(([id, message]) => ({
+            id,
+            messageCost: message.messageCost,
+            stepCosts: [...message.stepCosts.entries()],
+          })),
+        })),
+        budgets: [...budgets.entries()],
+        lockedBudgets: [...lockedBudgets],
+      }
+    },
     isLocked(sessionID) {
       return status(sessionID).locked
     },
@@ -206,11 +261,17 @@ export function runBudgetCommand(state, sessionID, args = "") {
   return { status, message }
 }
 
-export const createSessionBudgetPlugin = async ({ client }, options = {}) => {
+export const createSessionBudgetPlugin = async (input, options = {}) => {
+  const { client } = input
   const settings = normalizeOptions(options)
-  const state = createBudgetState(settings)
+  const persistence = createPersistence(input, options)
+  const state = createBudgetState(settings, await persistence.load())
   const notifiedBudgets = new Map()
   const abortedSessions = new Map()
+
+  async function save() {
+    await persistence.save(state.snapshot())
+  }
 
   async function enforce(sessionID) {
     const result = state.status(sessionID)
@@ -226,8 +287,7 @@ export const createSessionBudgetPlugin = async ({ client }, options = {}) => {
   async function stopWork(result) {
     for (const sessionID of result.sessionIDs) {
       if (abortedSessions.get(sessionID) === result.limitUsd) continue
-      abortedSessions.set(sessionID, result.limitUsd)
-      await abortSession(client, sessionID)
+      if (await abortSession(client, sessionID)) abortedSessions.set(sessionID, result.limitUsd)
     }
 
     if (notifiedBudgets.get(result.budgetID) === result.limitUsd) return
@@ -249,18 +309,21 @@ export const createSessionBudgetPlugin = async ({ client }, options = {}) => {
     event: async ({ event }) => {
       if (event.type === "session.created" || event.type === "session.updated") {
         state.upsertSession(event.properties.info)
+        await save()
         await enforce(event.properties.info.id)
         return
       }
 
       if (event.type === "session.deleted") {
         state.removeSession(event.properties.info.id)
+        await save()
         return
       }
 
       if (event.type === "message.updated") {
         const info = event.properties.info
         state.recordAssistantMessage(info)
+        await save()
         if (info?.sessionID) await enforce(info.sessionID)
         return
       }
@@ -268,6 +331,7 @@ export const createSessionBudgetPlugin = async ({ client }, options = {}) => {
       if (event.type === "message.part.updated") {
         const part = event.properties.part
         state.recordStepFinish(part)
+        await save()
         if (part?.sessionID) await enforce(part.sessionID)
       }
     },
@@ -280,6 +344,7 @@ export const createSessionBudgetPlugin = async ({ client }, options = {}) => {
     "command.execute.before": async (input) => {
       if (input.command === settings.commandName) {
         const result = runBudgetCommand(state, input.sessionID, input.arguments)
+        await save()
         notifiedBudgets.delete(result.status.budgetID)
         for (const sessionID of result.status.sessionIDs) abortedSessions.delete(sessionID)
         await log(client, result.status.locked ? "warn" : "info", result.message)
@@ -356,7 +421,10 @@ function formatUsd(value) {
 async function abortSession(client, sessionID) {
   try {
     await client.session?.abort?.({ path: { id: sessionID } })
-  } catch {}
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function log(client, level, message) {
@@ -376,4 +444,40 @@ async function toast(client, message, variant) {
       },
     })
   } catch {}
+}
+
+function createPersistence(input = {}, options = {}, env = globalThis.process?.env ?? {}) {
+  const enabled = parseBoolean(firstDefined(options.persistState, env.OPENCODE_SESSION_BUDGET_PERSIST_STATE), true)
+  if (!enabled) return { load: async () => undefined, save: async () => {} }
+
+  const configured = firstDefined(options.statePath, env.OPENCODE_SESSION_BUDGET_STATE)
+  const base = input.worktree || input.directory || globalThis.process?.cwd?.()
+  const file = configured ? String(configured) : base ? path.join(base, ".opencode", "session-budget-state.json") : undefined
+  if (!file) return { load: async () => undefined, save: async () => {} }
+
+  let pending = Promise.resolve()
+
+  async function write(snapshot) {
+    try {
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      const random = Math.random().toString(36).slice(2)
+      const temp = `${file}.${globalThis.process?.pid ?? "tmp"}.${Date.now()}.${random}.tmp`
+      await fs.writeFile(temp, `${JSON.stringify(snapshot)}\n`)
+      await fs.rename(temp, file)
+    } catch {}
+  }
+
+  return {
+    async load() {
+      try {
+        return JSON.parse(await fs.readFile(file, "utf8"))
+      } catch {
+        return undefined
+      }
+    },
+    save(snapshot) {
+      pending = pending.then(() => write(snapshot), () => write(snapshot))
+      return pending
+    },
+  }
 }

@@ -23,6 +23,8 @@ The plugin injects a `/budget` command for every Opencode session:
 
 The value is USD and is compared against Opencode's reported assistant message cost.
 
+Budget state is persisted per worktree in `.opencode/session-budget-state.json` so restarts keep the same limit and spend. Set `OPENCODE_SESSION_BUDGET_STATE=/path/to/state.json` or pass `{ "statePath": "/path/to/state.json" }` to move it. Set `OPENCODE_SESSION_BUDGET_PERSIST_STATE=false` or pass `{ "persistState": false }` to keep state in memory only.
+
 ## Install
 
 Recommended global install from a public GitHub repo:

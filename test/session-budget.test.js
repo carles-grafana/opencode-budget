@@ -1,4 +1,7 @@
 import assert from "node:assert/strict"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import test from "node:test"
 
 import SessionBudget from "../.opencode/session-budget.js"
@@ -121,7 +124,7 @@ test("plugin injects /budget and blocks work after session budget is reached", a
         },
       },
     },
-    {},
+    { persistState: false },
   )
 
   const cfg = {}
@@ -156,6 +159,75 @@ test("plugin injects /budget and blocks work after session budget is reached", a
 
   await assert.rejects(
     () => plugin["shell.env"]({ cwd: "/tmp", sessionID: "session-1" }, { env: {} }),
+    /Budget limit reached/,
+  )
+})
+
+test("plugin retries aborting locked sessions after abort failures", async () => {
+  let attempts = 0
+  const plugin = await SessionBudget(
+    {
+      client: {
+        session: {
+          abort: async () => {
+            attempts++
+            if (attempts === 1) throw new Error("transient abort failure")
+          },
+        },
+        app: { log: async () => {} },
+        tui: { showToast: async () => {} },
+      },
+    },
+    { persistState: false },
+  )
+
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 } },
+    },
+  })
+  await plugin.event({
+    event: {
+      type: "message.part.updated",
+      properties: { part: { type: "step-finish", sessionID: "session-1", messageID: "message-2", id: "step-1", cost: 0.01 } },
+    },
+  })
+
+  assert.equal(attempts, 2)
+})
+
+test("plugin persists budget state across restarts", async () => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const client = {
+    session: { abort: async () => {} },
+    app: { log: async () => {} },
+    tui: { showToast: async () => {} },
+  }
+
+  let plugin = await SessionBudget({ client, worktree, directory: worktree }, {})
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 } },
+    },
+  })
+
+  plugin = await SessionBudget({ client, worktree, directory: worktree }, {})
+
+  await assert.rejects(
+    () => plugin["tool.execute.before"]({ tool: "bash", sessionID: "session-1", callID: "call-1" }, { args: {} }),
     /Budget limit reached/,
   )
 })
