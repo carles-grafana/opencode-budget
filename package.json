@@ -1,0 +1,24 @@
+{
+  "name": "opencode-session-budget",
+  "version": "0.1.0",
+  "description": "Opencode plugin that stops session work when a /budget limit is reached.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    ".opencode/session-budget.js",
+    ".opencode/session-budget-core.js",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "budget"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}

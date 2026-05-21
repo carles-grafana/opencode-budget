@@ -1,0 +1,161 @@
+import assert from "node:assert/strict"
+import test from "node:test"
+
+import SessionBudget from "../.opencode/session-budget.js"
+import { createBudgetState, normalizeOptions, runBudgetCommand } from "../.opencode/session-budget-core.js"
+
+test("normalizes budget options", () => {
+  assert.deepEqual(normalizeOptions({ defaultLimitUsd: "$0.25", includeChildSessions: false, commandName: "cost" }, {}), {
+    commandName: "cost",
+    defaultLimitUsd: 0.25,
+    includeChildSessions: false,
+  })
+
+  assert.deepEqual(normalizeOptions({}, { OPENCODE_SESSION_BUDGET_USD: "0.5" }), {
+    commandName: "budget",
+    defaultLimitUsd: 0.5,
+    includeChildSessions: true,
+  })
+})
+
+test("locks a session when assistant message costs reach the limit", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+
+  state.upsertSession({ id: "session-1" })
+  state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 })
+  assert.equal(state.status("session-1").locked, false)
+
+  state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-2", cost: 0.03 })
+
+  const first = state.status("session-1")
+  assert.equal(first.locked, true)
+  assert.equal(first.justLocked, true)
+  assert.equal(first.spentUsd, 0.05)
+
+  const second = state.status("session-1")
+  assert.equal(second.locked, true)
+  assert.equal(second.justLocked, false)
+})
+
+test("includes child sessions in parent budget by default", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+
+  state.upsertSession({ id: "parent" })
+  state.upsertSession({ id: "child", parentID: "parent" })
+  state.recordAssistantMessage({ role: "assistant", sessionID: "parent", id: "message-1", cost: 0.02 })
+  state.recordAssistantMessage({ role: "assistant", sessionID: "child", id: "message-2", cost: 0.03 })
+
+  const result = state.status("child")
+  assert.equal(result.locked, true)
+  assert.equal(result.budgetID, "parent")
+  assert.deepEqual(new Set(result.sessionIDs), new Set(["parent", "child"]))
+})
+
+test("uses the larger of assistant message cost and summed step costs", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+
+  state.upsertSession({ id: "session-1" })
+  state.recordStepFinish({ type: "step-finish", sessionID: "session-1", messageID: "message-1", id: "step-1", cost: 0.02 })
+  state.recordStepFinish({ type: "step-finish", sessionID: "session-1", messageID: "message-1", id: "step-2", cost: 0.02 })
+  assert.equal(state.spentUsd("session-1"), 0.04)
+
+  state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.05 })
+  assert.equal(state.spentUsd("session-1"), 0.05)
+})
+
+test("sets and clears a per-session budget through the budget command", () => {
+  const state = createBudgetState({ includeChildSessions: true })
+
+  state.upsertSession({ id: "session-1" })
+  assert.match(runBudgetCommand(state, "session-1", "").message, /No budget set/)
+
+  const set = runBudgetCommand(state, "session-1", "$0.05")
+  assert.equal(set.status.limitUsd, 0.05)
+  assert.equal(set.status.locked, false)
+
+  state.recordAssistantMessage({ role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.05 })
+  assert.equal(state.status("session-1").locked, true)
+
+  const raised = runBudgetCommand(state, "session-1", "set 0.10 usd")
+  assert.equal(raised.status.limitUsd, 0.1)
+  assert.equal(raised.status.locked, false)
+
+  const cleared = runBudgetCommand(state, "session-1", "off")
+  assert.equal(cleared.status.limitUsd, undefined)
+  assert.equal(cleared.status.locked, false)
+})
+
+test("/budget off disables the env default for that session", () => {
+  const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
+
+  state.upsertSession({ id: "session-1" })
+  assert.equal(state.status("session-1").limitUsd, 0.05)
+
+  const cleared = runBudgetCommand(state, "session-1", "off")
+  assert.equal(cleared.status.limitUsd, undefined)
+  assert.equal(cleared.status.locked, false)
+})
+
+test("plugin entry exports only the plugin function", async () => {
+  const mod = await import("../.opencode/session-budget.js")
+
+  assert.deepEqual(Object.keys(mod), ["default"])
+  assert.equal(typeof mod.default, "function")
+})
+
+test("plugin injects /budget and blocks work after session budget is reached", async () => {
+  const aborted = []
+  const logs = []
+  const toasts = []
+  const plugin = await SessionBudget(
+    {
+      client: {
+        session: {
+          abort: async ({ path }) => aborted.push(path.id),
+        },
+        app: {
+          log: async ({ body }) => logs.push(body),
+        },
+        tui: {
+          showToast: async ({ body }) => toasts.push(body),
+        },
+      },
+    },
+    {},
+  )
+
+  const cfg = {}
+  await plugin.config(cfg)
+  assert.deepEqual(cfg.command.budget, {
+    description: "Set or show the current session budget",
+    template: "$ARGUMENTS",
+  })
+
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  await plugin.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 } },
+    },
+  })
+
+  assert.deepEqual(aborted, ["session-1"])
+  assert.equal(logs.length, 2)
+  assert.equal(toasts.length, 2)
+
+  await assert.rejects(
+    () => plugin["tool.execute.before"]({ tool: "bash", sessionID: "session-1", callID: "call-1" }, { args: {} }),
+    /Budget limit reached/,
+  )
+
+  await assert.rejects(
+    () => plugin["shell.env"]({ cwd: "/tmp", sessionID: "session-1" }, { env: {} }),
+    /Budget limit reached/,
+  )
+})
