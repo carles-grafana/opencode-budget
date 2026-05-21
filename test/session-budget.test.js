@@ -54,6 +54,48 @@ test("includes child sessions in parent budget by default", () => {
   assert.deepEqual(new Set(result.sessionIDs), new Set(["parent", "child"]))
 })
 
+test("does not resurrect deleted parent sessions from persisted state", () => {
+  const state = createBudgetState({ includeChildSessions: true })
+
+  state.upsertSession({ id: "parent" })
+  state.upsertSession({ id: "child", parentID: "parent" })
+  state.removeSession("parent")
+  runBudgetCommand(state, "child", "0.05")
+
+  const restored = createBudgetState({ includeChildSessions: true }, state.snapshot())
+  const status = restored.status("child")
+
+  assert.equal(status.budgetID, "child")
+  assert.equal(status.limitUsd, 0.05)
+  assert.deepEqual(status.sessionIDs, ["child"])
+})
+
+test("ignores malformed persisted state entries", () => {
+  let warnings = 0
+  const state = createBudgetState(
+    { includeChildSessions: true },
+    {
+      version: 1,
+      sessions: [
+        {
+          id: "session-1",
+          parentID: "missing-parent",
+          messages: [{ id: "message-1", messageCost: "bad", stepCosts: [null, ["step-1", 0.01]] }],
+        },
+      ],
+      budgets: [null, ["session-1", 0.05], ["bad", "not-money"]],
+      lockedBudgets: [null, "session-1"],
+    },
+    () => warnings++,
+  )
+
+  const status = state.status("session-1")
+  assert.equal(status.budgetID, "session-1")
+  assert.equal(status.limitUsd, 0.05)
+  assert.equal(status.spentUsd, 0.01)
+  assert.equal(warnings, 1)
+})
+
 test("uses the larger of assistant message cost and summed step costs", () => {
   const state = createBudgetState({ defaultLimitUsd: 0.05, includeChildSessions: true })
 
@@ -203,8 +245,18 @@ test("plugin retries aborting locked sessions after abort failures", async () =>
   assert.equal(attempts, 2)
 })
 
-test("plugin persists budget state across restarts", async () => {
+test("plugin persists budget state outside the worktree by default", async (t) => {
   const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const stateHome = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-state-"))
+  const previousStateHome = process.env.XDG_STATE_HOME
+  process.env.XDG_STATE_HOME = stateHome
+  t.after(async () => {
+    if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = previousStateHome
+    await fs.rm(worktree, { recursive: true, force: true })
+    await fs.rm(stateHome, { recursive: true, force: true })
+  })
+
   const client = {
     session: { abort: async () => {} },
     app: { log: async () => {} },
@@ -223,6 +275,7 @@ test("plugin persists budget state across restarts", async () => {
       properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.02 } },
     },
   })
+  assert.equal(await pathExists(path.join(worktree, ".opencode", "session-budget-state.json")), false)
 
   plugin = await SessionBudget({ client, worktree, directory: worktree }, {})
 
@@ -231,3 +284,12 @@ test("plugin persists budget state across restarts", async () => {
     /Budget limit reached/,
   )
 })
+
+async function pathExists(file) {
+  try {
+    await fs.access(file)
+    return true
+  } catch {
+    return false
+  }
+}
