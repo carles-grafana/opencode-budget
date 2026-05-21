@@ -81,6 +81,26 @@ test("does not resurrect deleted parent sessions from persisted state", () => {
   assert.deepEqual(status.sessionIDs, ["child"])
 })
 
+test("ignores stale parent links to deleted sessions", () => {
+  const state = createBudgetState({ includeChildSessions: true })
+
+  state.upsertSession({ id: "parent" })
+  state.upsertSession({ id: "child", parentID: "parent" })
+  state.removeSession("parent")
+  runBudgetCommand(state, "child", "0.05")
+
+  state.upsertSession({ id: "child", parentID: "parent" })
+
+  const status = state.status("child")
+  assert.equal(status.budgetID, "child")
+  assert.equal(status.limitUsd, 0.05)
+  assert.deepEqual(status.sessionIDs, ["child"])
+  assert.deepEqual(
+    state.snapshot().sessions.map((item) => item.id),
+    ["child"],
+  )
+})
+
 test("ignores malformed persisted state entries", () => {
   let warnings = 0
   const state = createBudgetState(
@@ -433,6 +453,300 @@ test("concurrent plugin instances merge persisted state", async (t) => {
   )
 })
 
+test("concurrent plugin instances merge same-session messages", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await second.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "1" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  await first.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.1 } },
+    },
+  })
+  await waitFor(async () => snapshotMessageIDs(path.join(worktree, statePath), "session-1").then((ids) => ids.includes("message-1")))
+
+  await second.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-2", cost: 0.2 } },
+    },
+  })
+
+  await waitFor(async () => {
+    const ids = await snapshotMessageIDs(path.join(worktree, statePath), "session-1")
+    return ids.includes("message-1") && ids.includes("message-2")
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /Spent \$0\.3000/,
+  )
+})
+
+test("concurrent plugin instances preserve child parent links", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const file = path.join(worktree, statePath)
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await second.event({ event: { type: "session.created", properties: { info: { id: "child" } } } })
+  await waitFor(async () => Boolean(await snapshotSession(file, "child")))
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "parent" } } } })
+  await first.event({ event: { type: "session.created", properties: { info: { id: "child", parentID: "parent" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "parent", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await first.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "child", id: "message-1", cost: 0.03 } },
+    },
+  })
+  await waitFor(async () => (await snapshotSession(file, "child"))?.parentID === "parent")
+
+  await second.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "child", id: "message-2", cost: 0.01 } },
+    },
+  })
+
+  await waitFor(async () => {
+    const session = await snapshotSession(file, "child")
+    const ids = session?.messages.map((item) => item.id) ?? []
+    return session?.parentID === "parent" && ids.includes("message-1") && ids.includes("message-2")
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "child", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.0500.*Spent \$0\.0400/,
+  )
+})
+
+test("concurrent plugin instances do not restore stale budgets", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "off" }, { parts: [] }),
+    /Budget disabled/,
+  )
+  await second.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.001 } },
+    },
+  })
+
+  await waitFor(async () => {
+    const session = await snapshotSession(path.join(worktree, statePath), "session-1")
+    return session?.messages.some((item) => item.id === "message-1")
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /No budget set.*Spent \$0\.0010/,
+  )
+})
+
+test("same-millisecond budget changes keep command order", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const originalNow = Date.now
+  const originalRandomBytes = crypto.randomBytes
+  let randomCalls = 0
+  Date.now = () => 1000
+  crypto.randomBytes = (size) => Buffer.alloc(size, randomCalls++ === 0 ? 0xff : 0x00)
+  t.after(async () => {
+    Date.now = originalNow
+    crypto.randomBytes = originalRandomBytes
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "off" }, { parts: [] }),
+    /Budget disabled/,
+  )
+  await second.event({
+    event: {
+      type: "message.updated",
+      properties: { info: { role: "assistant", sessionID: "session-1", id: "message-1", cost: 0.001 } },
+    },
+  })
+
+  await waitFor(async () => {
+    const session = await snapshotSession(path.join(worktree, statePath), "session-1")
+    return session?.messages.some((item) => item.id === "message-1")
+  })
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /No budget set.*Spent \$0\.0010/,
+  )
+})
+
+test("stale plugin instance can make a later budget change", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  t.after(async () => {
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "off" }, { parts: [] }),
+    /Budget disabled/,
+  )
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await delay(2)
+  await assert.rejects(
+    () => second["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.10" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.1000/,
+  )
+})
+
+test("same-millisecond cross-instance budget changes use write order", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const originalNow = Date.now
+  const originalRandomBytes = crypto.randomBytes
+  let randomCalls = 0
+  Date.now = () => 1000
+  crypto.randomBytes = (size) => Buffer.alloc(size, randomCalls++ === 1 ? 0xff : 0x00)
+  t.after(async () => {
+    Date.now = originalNow
+    crypto.randomBytes = originalRandomBytes
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const first = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await first.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const second = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await assert.rejects(
+    () => first["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await assert.rejects(
+    () => second["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.10" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.1000/,
+  )
+})
+
+test("budget changes survive a backward clock", async (t) => {
+  const worktree = await fs.mkdtemp(path.join(os.tmpdir(), "session-budget-"))
+  const statePath = "state/session-budget.json"
+  const originalNow = Date.now
+  const times = [1000, 900]
+  Date.now = () => times.shift() ?? 900
+  t.after(async () => {
+    Date.now = originalNow
+    await fs.rm(worktree, { recursive: true, force: true })
+  })
+
+  const client = { session: { abort: async () => {} }, app: { log: async () => {} }, tui: { showToast: async () => {} } }
+  const plugin = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+
+  await plugin.event({ event: { type: "session.created", properties: { info: { id: "session-1" } } } })
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.01" }, { parts: [] }),
+    /Budget set to/,
+  )
+  await assert.rejects(
+    () => plugin["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "0.05" }, { parts: [] }),
+    /Budget set to/,
+  )
+
+  const restored = await SessionBudget({ client, worktree, directory: worktree }, { statePath })
+  await assert.rejects(
+    () => restored["command.execute.before"]({ command: "budget", sessionID: "session-1", arguments: "status" }, { parts: [] }),
+    /Budget is \$0\.0500/,
+  )
+})
+
 async function pathExists(file) {
   try {
     await fs.access(file)
@@ -440,6 +754,20 @@ async function pathExists(file) {
   } catch {
     return false
   }
+}
+
+async function snapshotMessageIDs(file, sessionID) {
+  const snapshot = JSON.parse(await fs.readFile(file, "utf8"))
+  return snapshot.sessions.find((item) => item.id === sessionID)?.messages.map((item) => item.id) ?? []
+}
+
+async function snapshotSession(file, sessionID) {
+  const snapshot = JSON.parse(await fs.readFile(file, "utf8"))
+  return snapshot.sessions.find((item) => item.id === sessionID)
+}
+
+async function delay(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function defaultStatePath(stateHome, worktree) {

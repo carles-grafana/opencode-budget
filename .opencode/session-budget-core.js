@@ -28,6 +28,9 @@ export function normalizeOptions(options = {}, env = globalThis.process?.env ?? 
 export function createBudgetState(settings, snapshot, onRestoreWarning = () => {}) {
   const sessions = new Map()
   const budgets = new Map()
+  const budgetVersions = new Map()
+  const changedBudgets = new Set()
+  let budgetVersionSequence = 0
   const lockedBudgets = new Set()
   const deletedSessions = new Set()
 
@@ -65,13 +68,14 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       sessions.get(session.parentID).children.delete(info.id)
     }
 
-    session.parentID = info.parentID
+    const parentID = info.parentID && !deletedSessions.has(info.parentID) ? info.parentID : undefined
+    session.parentID = parentID
 
-    if (info.parentID) {
-      getSession(info.parentID).children.add(info.id)
+    if (parentID) {
+      getSession(parentID).children.add(info.id)
     }
 
-    return !existed || previousParentID !== info.parentID
+    return !existed || previousParentID !== parentID
   }
 
   function removeSession(sessionID) {
@@ -89,6 +93,7 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
 
     sessions.delete(sessionID)
     budgets.delete(sessionID)
+    budgetVersions.delete(sessionID)
     lockedBudgets.delete(sessionID)
     deletedSessions.add(sessionID)
     return true
@@ -219,6 +224,19 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
       else invalid = true
     }
 
+    for (const entry of Array.isArray(snapshot.budgetVersions) ? snapshot.budgetVersions : []) {
+      if (!Array.isArray(entry) || entry.length !== 2) {
+        invalid = true
+        continue
+      }
+
+      const [budgetID, version] = entry
+      if (budgetID && typeof budgetID === "string" && isBudgetVersion(version)) {
+        budgetVersions.set(budgetID, version)
+        budgetVersionSequence = Math.max(budgetVersionSequence, budgetVersionSequenceOf(version))
+      } else invalid = true
+    }
+
     for (const budgetID of Array.isArray(snapshot.lockedBudgets) ? snapshot.lockedBudgets : []) {
       if (budgetID && typeof budgetID === "string") lockedBudgets.add(budgetID)
       else invalid = true
@@ -298,11 +316,15 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
     setBudget(sessionID, limitUsd) {
       const budgetID = budgetIDFor(sessionID)
       budgets.set(budgetID, limitUsd)
+      budgetVersions.set(budgetID, nextBudgetVersion(++budgetVersionSequence))
+      changedBudgets.add(budgetID)
       return status(sessionID)
     },
     clearBudget(sessionID) {
       const budgetID = budgetIDFor(sessionID)
       budgets.set(budgetID, null)
+      budgetVersions.set(budgetID, nextBudgetVersion(++budgetVersionSequence))
+      changedBudgets.add(budgetID)
       lockedBudgets.delete(budgetID)
       return status(sessionID)
     },
@@ -320,9 +342,14 @@ export function createBudgetState(settings, snapshot, onRestoreWarning = () => {
           })),
         })),
         budgets: [...budgets.entries()],
+        budgetVersions: [...budgetVersions.entries()],
+        changedBudgets: [...changedBudgets],
         lockedBudgets: [...lockedBudgets],
         deletedSessions: [...deletedSessions],
       }
+    },
+    markBudgetChangesSaved(budgetIDs = []) {
+      for (const budgetID of budgetIDs) changedBudgets.delete(budgetID)
     },
     isLocked(sessionID) {
       return status(sessionID).locked
@@ -374,11 +401,15 @@ export const createSessionBudgetPlugin = async (input, options = {}) => {
   const abortedSessions = new Map()
 
   function saveSoon() {
-    void persistence.save(state.snapshot())
+    const snapshot = state.snapshot()
+    state.markBudgetChangesSaved(snapshot.changedBudgets)
+    void persistence.save(snapshot)
   }
 
   async function saveNow() {
-    await persistence.save(state.snapshot(), true)
+    const snapshot = state.snapshot()
+    state.markBudgetChangesSaved(snapshot.changedBudgets)
+    await persistence.save(snapshot, true)
   }
 
   async function enforce(sessionID) {
@@ -659,24 +690,30 @@ function mergeSnapshots(current, next) {
   if (!current || current.version !== STATE_VERSION) return next
 
   const deleted = new Set([...(arrayOfStrings(current.deletedSessions) ?? []), ...(arrayOfStrings(next.deletedSessions) ?? [])])
+  const changedBudgets = new Set(arrayOfStrings(next.changedBudgets) ?? [])
   const sessions = new Map()
   const budgets = new Map()
+  const budgetVersions = new Map()
   const lockedBudgets = new Set()
 
   for (const item of Array.isArray(current.sessions) ? current.sessions : []) {
-    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, item)
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted))
   }
 
   for (const item of Array.isArray(next.sessions) ? next.sessions : []) {
-    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, item)
+    if (item?.id && typeof item.id === "string" && !deleted.has(item.id)) sessions.set(item.id, mergeSessionSnapshot(sessions.get(item.id), item, deleted))
   }
 
   for (const entry of Array.isArray(current.budgets) ? current.budgets : []) {
-    if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && !deleted.has(entry[0])) budgets.set(entry[0], entry[1])
+    applyBudgetEntry(budgets, budgetVersions, entry, budgetVersionFor(current, entry?.[0]), deleted)
   }
 
   for (const entry of Array.isArray(next.budgets) ? next.budgets : []) {
-    if (Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && !deleted.has(entry[0])) budgets.set(entry[0], entry[1])
+    const budgetID = entry?.[0]
+    const version = changedBudgets.has(budgetID)
+      ? changedBudgetVersion(budgetVersions.get(budgetID), budgetVersionFor(next, budgetID))
+      : budgetVersionFor(next, budgetID)
+    applyBudgetEntry(budgets, budgetVersions, entry, version, deleted)
   }
 
   for (const budgetID of arrayOfStrings(current.lockedBudgets) ?? []) {
@@ -691,9 +728,114 @@ function mergeSnapshots(current, next) {
     version: STATE_VERSION,
     sessions: [...sessions.values()],
     budgets: [...budgets.entries()],
+    budgetVersions: [...budgetVersions.entries()],
+    changedBudgets: [],
     lockedBudgets: [...lockedBudgets],
     deletedSessions: [...deleted],
   }
+}
+
+function changedBudgetVersion(currentVersion, nextVersion) {
+  const sequence = Math.max(budgetVersionSequenceOf(currentVersion), budgetVersionSequenceOf(nextVersion)) + 1
+  const time = Math.max(Date.now(), Number.isFinite(currentVersion?.time) ? currentVersion.time : 0, nextVersion.time)
+  return { time, sequence, id: crypto.randomBytes(8).toString("hex") }
+}
+
+function applyBudgetEntry(budgets, budgetVersions, entry, version, deleted) {
+  if (!Array.isArray(entry) || entry.length !== 2 || typeof entry[0] !== "string" || deleted.has(entry[0])) return
+
+  const [budgetID, limitUsd] = entry
+  const currentVersion = budgetVersions.get(budgetID)
+  if (currentVersion && compareBudgetVersions(currentVersion, version) > 0) return
+
+  budgets.set(budgetID, limitUsd)
+  budgetVersions.set(budgetID, version)
+}
+
+function budgetVersionFor(snapshot, budgetID) {
+  if (!budgetID || typeof budgetID !== "string") return legacyBudgetVersion()
+
+  for (const entry of Array.isArray(snapshot.budgetVersions) ? snapshot.budgetVersions : []) {
+    if (Array.isArray(entry) && entry.length === 2 && entry[0] === budgetID && isBudgetVersion(entry[1])) return entry[1]
+  }
+
+  return legacyBudgetVersion()
+}
+
+function mergeSessionSnapshot(current, next, deleted) {
+  if (!current) return next
+
+  const messages = new Map()
+  for (const item of Array.isArray(current.messages) ? current.messages : []) {
+    if (item?.id && typeof item.id === "string") messages.set(item.id, mergeMessageSnapshot(messages.get(item.id), item))
+  }
+  for (const item of Array.isArray(next.messages) ? next.messages : []) {
+    if (item?.id && typeof item.id === "string") messages.set(item.id, mergeMessageSnapshot(messages.get(item.id), item))
+  }
+
+  let parentID = next.parentID !== undefined ? next.parentID : current.parentID
+  if (parentID && deleted.has(parentID)) parentID = undefined
+
+  return {
+    ...current,
+    ...next,
+    parentID,
+    messages: [...messages.values()],
+  }
+}
+
+function mergeMessageSnapshot(current, next) {
+  if (!current) return next
+
+  const stepCosts = new Map()
+  for (const [stepID, cost] of validStepCosts(current.stepCosts)) stepCosts.set(stepID, cost)
+  for (const [stepID, cost] of validStepCosts(next.stepCosts)) {
+    const existing = stepCosts.get(stepID)
+    stepCosts.set(stepID, Number.isFinite(existing) ? Math.max(existing, cost) : cost)
+  }
+
+  const costs = [current.messageCost, next.messageCost].filter(Number.isFinite)
+  return {
+    ...current,
+    ...next,
+    messageCost: costs.length > 0 ? Math.max(...costs) : 0,
+    stepCosts: [...stepCosts.entries()],
+  }
+}
+
+function validStepCosts(value) {
+  return Array.isArray(value)
+    ? value.filter((entry) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && Number.isFinite(entry[1]))
+    : []
+}
+
+function nextBudgetVersion(sequence) {
+  return { time: Date.now(), sequence, id: crypto.randomBytes(8).toString("hex") }
+}
+
+function legacyBudgetVersion() {
+  return { time: 0, sequence: 0, id: "" }
+}
+
+function isBudgetVersion(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    Number.isFinite(value.time) &&
+    (value.sequence === undefined || Number.isFinite(value.sequence)) &&
+    typeof value.id === "string"
+  )
+}
+
+function budgetVersionSequenceOf(value) {
+  return Number.isFinite(value?.sequence) ? value.sequence : 0
+}
+
+function compareBudgetVersions(left, right) {
+  if (left.time !== right.time) return left.time - right.time
+  const sequenceDiff = budgetVersionSequenceOf(left) - budgetVersionSequenceOf(right)
+  if (sequenceDiff !== 0) return sequenceDiff
+  return 0
 }
 
 function arrayOfStrings(value) {
